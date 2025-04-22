@@ -1,17 +1,26 @@
-# Use the official Node.js image as the base image
 FROM node:23.11.0-alpine3.21
 
-# Set the working directory inside the container
+# Puppeteer يحتاج مكتبات معينة في alpine
+RUN apk add --no-cache \
+  chromium \
+  nss \
+  freetype \
+  harfbuzz \
+  ca-certificates \
+  ttf-freefont \
+  nodejs \
+  yarn \
+  udev \
+  bash
+
+# Set environment variable so Puppeteer skips downloading Chromium
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+
 WORKDIR /usr/src/app
 
-# Copy package.json and package-lock.json to the working directory
 COPY package*.json ./
-
-# Install dependencies
 RUN npm install
-
-# Copy the rest of the application code to the working directory
 COPY . .
 
-# Define the command to run the application
 CMD ["npm", "start"]
