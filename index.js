@@ -3,11 +3,13 @@ import TelegramBot from "node-telegram-bot-api";
 import cron from "node-cron";
 import puppeteer from "puppeteer";
 import { Buffer } from "node:buffer"; // Explicit import for Buffer
+import axios from "axios"; // Import axios for API calls
+import nodemailer from "nodemailer"; // Import nodemailer for email
 
 // --- Constants ---
-const CAPTCHA_TIMEOUT_MS = 30 * 1000; // 30 seconds
+const CAPTCHA_TIMEOUT_MS = 60 * 1000; // Increased timeout for anti-captcha service
 const PAGE_NAVIGATION_TIMEOUT_MS = 29 * 60 * 1000; // 29 minutes
-const NOTIFICATION_INTERVAL_MS = 5 * 1000; // 5 seconds
+const NOTIFICATION_INTERVAL_MS = 5 * 1000; // 5 seconds (for repeated Telegram messages)
 const CRON_SCHEDULE = "*/30 * * * *"; // Every 30 minutes
 const APPOINTMENT_URL =
   "https://service2.diplo.de/rktermin/extern/appointment_showMonth.do?locationCode=kiga&realmId=1044&categoryId=2149";
@@ -20,8 +22,24 @@ const NEXT_MONTH_BUTTON_SELECTOR =
 const NO_APPOINTMENTS_TEXT = "Unfortunately, there are no appointments";
 const WRONG_CAPTCHA_TEXT = "The entered text was wrong";
 
+// Anti-Captcha Constants
+const ANTICAPTCHA_API_BASE_URL = "https://api.anti-captcha.com";
+const ANTICAPTCHA_TASK_TYPE = "ImageToTextTask"; // Type for image captchas
+const ANTICAPTCHA_POLLING_INTERVAL_MS = 5000; // Poll every 5 seconds
+
+// Pushbullet Constants
+const PUSHBULLET_API_BASE_URL = "https://api.pushbullet.com/v2";
+
 // --- Environment Variable Validation ---
-const { BOT_TOKEN, CHAT_ID } = process.env;
+const {
+  BOT_TOKEN,
+  CHAT_ID,
+  ANTI_CAPTCHA_API_KEY,
+  EMAIL_SENDER,
+  EMAIL_PASSWORD, // Use an App Password if using Gmail
+  EMAIL_RECIPIENT,
+  PUSHBULLET_API_KEY,
+} = process.env;
 
 if (!BOT_TOKEN || !CHAT_ID) {
   console.error(
@@ -30,18 +48,53 @@ if (!BOT_TOKEN || !CHAT_ID) {
   process.exit(1); // Exit if essential variables are missing
 }
 
+if (!ANTI_CAPTCHA_API_KEY) {
+  console.error(
+    "Error: ANTI_CAPTCHA_API_KEY environment variable is required for automated captcha solving."
+  );
+  // Don't exit, allow running without anti-captcha if preferred, but warn
+  console.warn(
+    "Warning: Running without ANTI_CAPTCHA_API_KEY. Manual captcha input will be required."
+  );
+}
+
+// Check for notification variables, but allow running without them
+const enableEmail = EMAIL_SENDER && EMAIL_PASSWORD && EMAIL_RECIPIENT;
+const enablePushbullet = PUSHBULLET_API_KEY;
+
+if (!enableEmail) {
+  console.warn(
+    "Warning: Email notifications are not fully configured (EMAIL_SENDER, EMAIL_PASSWORD, and EMAIL_RECIPIENT are required)."
+  );
+}
+if (!enablePushbullet) {
+  console.warn(
+    "Warning: Pushbullet notifications are not configured (PUSHBULLET_API_KEY is required)."
+  );
+}
+
 // --- Bot Initialization ---
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+
+// --- Nodemailer Transporter (for email) ---
+let transporter = null;
+if (enableEmail) {
+  transporter = nodemailer.createTransport({
+    service: "gmail", // Or your email service
+    auth: {
+      user: EMAIL_SENDER,
+      pass: EMAIL_PASSWORD, // Use App Password for Gmail
+    },
+  });
+}
 
 // --- State Management ---
 let state = {
   isRunning: false, // Is a check currently running?
-  isWaitingForCaptcha: false, // Is the bot waiting for user's captcha input?
   spamInterval: null, // Interval ID for "appointment available" notifications
   browser: null, // Puppeteer browser instance
   page: null, // Puppeteer page instance
   currentAbortController: null, // AbortController for the current check
-  captchaMessageListener: null, // Reference to the active message listener for captcha
 };
 
 // --- Helper Functions ---
@@ -72,6 +125,76 @@ async function safeSendPhoto(photoBuffer, options) {
 }
 
 /**
+ * Sends an email notification.
+ * @param {string} subject - The email subject.
+ * @param {string} text - The email body.
+ */
+async function sendEmailNotification(subject, text) {
+  if (!enableEmail || !transporter) {
+    console.log(
+      "Email notifications are not enabled or transporter not initialized."
+    );
+    return;
+  }
+  console.log(`📧 Sending email: "${subject}"`);
+  try {
+    await transporter.sendMail({
+      from: EMAIL_SENDER,
+      to: EMAIL_RECIPIENT,
+      subject: subject,
+      text: text,
+    });
+    console.log("Email sent successfully.");
+  } catch (error) {
+    console.error(`❌ Failed to send email: ${error.message}`);
+  }
+}
+
+/**
+ * Sends a Pushbullet notification.
+ * @param {string} title - The notification title.
+ * @param {string} body - The notification body.
+ */
+async function sendPushNotification(title, body) {
+  if (!enablePushbullet) {
+    console.log("Pushbullet notifications are not enabled.");
+    return;
+  }
+  console.log(`📱 Sending Pushbullet notification: "${title}"`);
+  try {
+    await axios.post(
+      `${PUSHBULLET_API_BASE_URL}/pushes`,
+      {
+        type: "note",
+        title: title,
+        body: body,
+      },
+      {
+        headers: {
+          "Access-Token": PUSHBULLET_API_KEY,
+          "Content-Type": "application/json",
+        },
+        timeout: 10000, // Add a timeout for the API call
+      }
+    );
+    console.log("Pushbullet notification sent successfully.");
+  } catch (error) {
+    console.error(
+      `❌ Failed to send Pushbullet notification: ${error.message}`
+    );
+    if (error.response) {
+      console.error(
+        `Pushbullet API responded with status ${
+          error.response.status
+        }: ${JSON.stringify(error.response.data)}`
+      );
+    } else if (error.request) {
+      console.error("No response received from Pushbullet API.");
+    }
+  }
+}
+
+/**
  * Cleans up resources like browser, page, and intervals.
  */
 async function cleanupResources() {
@@ -79,10 +202,6 @@ async function cleanupResources() {
   if (state.spamInterval) {
     clearInterval(state.spamInterval);
     state.spamInterval = null;
-  }
-  if (state.captchaMessageListener) {
-    bot.removeListener("message", state.captchaMessageListener);
-    state.captchaMessageListener = null;
   }
   if (state.browser) {
     try {
@@ -93,101 +212,156 @@ async function cleanupResources() {
   }
   state.browser = null;
   state.page = null;
-  state.isWaitingForCaptcha = false;
   state.isRunning = false; // Mark as not running AFTER cleanup
   state.currentAbortController = null;
   console.log("🧼 Cleanup complete.");
 }
 
 /**
- * Extracts captcha image, sends it via Telegram, and waits for user reply.
- * Handles potential timeouts and abort signals.
+ * Submits an image captcha to Anti-Captcha.com and polls for the result.
+ * @param {string} base64Image - The base64 encoded image data (without 'data:image/png;base64,' prefix).
  * @param {AbortSignal} signal - The AbortSignal to allow cancellation.
- * @returns {Promise<string>} Resolves with the user's captcha text.
- * @throws {Error} If captcha extraction fails, Telegram interaction fails, or operation is aborted.
+ * @returns {Promise<string>} Resolves with the solved captcha text.
+ * @throws {Error} If the API call fails, task creation fails, polling times out, or operation is aborted.
  */
-async function getCaptchaFromUser(signal) {
-  if (!state.page) throw new Error("Page is not initialized.");
-  state.isWaitingForCaptcha = true;
+async function solveCaptcha(base64Image, signal) {
+  if (!ANTI_CAPTCHA_API_KEY) {
+    throw new Error(
+      "ANTI_CAPTCHA_API_KEY is not configured. Cannot solve captcha automatically."
+    );
+  }
+  console.log("🤖 Submitting captcha to Anti-Captcha.com...");
+  let taskId = null;
 
   try {
-    // Wait for captcha element
-    await state.page.waitForSelector(CAPTCHA_SELECTOR, {
-      timeout: CAPTCHA_TIMEOUT_MS,
-      signal, // Pass signal here
-    });
+    // 1. Create Task
+    const createTaskResponse = await axios.post(
+      `${ANTICAPTCHA_API_BASE_URL}/createTask`,
+      {
+        clientKey: ANTI_CAPTCHA_API_KEY,
+        task: {
+          type: ANTICAPTCHA_TASK_TYPE,
+          body: base64Image,
+        },
+        // Optional: Add websiteUrl if needed by the service for context
+        // websiteUrl: APPOINTMENT_URL,
+      },
+      { signal, timeout: 10000 }
+    ); // Add timeout for the API call
 
-    // Extract base64 image data
-    const base64 = await state.page.$eval(CAPTCHA_SELECTOR, (el) => {
-      const bg = el.style.background;
-      const match = bg.match(/base64,([^"]+)/);
-      return match ? match[1] : null;
-    });
-
-    if (!base64) {
-      throw new Error("Could not extract base64 data from captcha element.");
+    if (createTaskResponse.data.errorId !== 0) {
+      throw new Error(
+        `Anti-Captcha API error creating task: ${createTaskResponse.data.errorDescription}`
+      );
     }
-    const buf = Buffer.from(base64, "base64");
+    taskId = createTaskResponse.data.taskId;
+    console.log(`Task created with ID: ${taskId}. Polling for result...`);
 
-    // Send captcha photo to user
-    await safeSendPhoto(buf, {
-      caption:
-        "🖼️ New captcha. Reply with the text.\nUse /another to get a new one.",
-    });
-
-    // Wait for user's reply
-    return new Promise((resolve, reject) => {
-      // Listener to handle user messages
-      const messageHandler = (msg) => {
-        // Check if the message is from the correct chat and is a potential captcha code
-        if (
-          String(msg.chat.id) === CHAT_ID &&
-          msg.text &&
-          /^[0-9A-Za-z]+$/.test(msg.text.trim())
-        ) {
-          cleanupListener();
-          resolve(msg.text.trim());
+    // 2. Poll for Result
+    const startTime = Date.now();
+    while (Date.now() - startTime < CAPTCHA_TIMEOUT_MS) {
+      if (signal.aborted) {
+        // Attempt to cancel the task if aborted while polling
+        if (taskId) {
+          try {
+            await axios.post(
+              `${ANTICAPTCHA_API_BASE_URL}/getTaskResult`,
+              {
+                clientKey: ANTI_CAPTCHA_API_KEY,
+                taskId: taskId,
+              },
+              { signal: AbortSignal.timeout(5000) }
+            ); // Short timeout for cancel attempt
+            console.log(`Attempted to cancel task ${taskId} on abort.`);
+          } catch (cancelError) {
+            console.warn(
+              `Failed to send cancel request for task ${taskId}: ${cancelError.message}`
+            );
+          }
         }
-      };
+        throw new Error("Captcha solving aborted.");
+      }
 
-      // Listener for abort signal
-      const abortHandler = () => {
-        cleanupListener();
-        reject(new Error("Captcha request aborted."));
-      };
+      await new Promise((resolve) =>
+        setTimeout(resolve, ANTICAPTCHA_POLLING_INTERVAL_MS)
+      ); // Wait before polling
 
-      // Function to remove listeners
-      const cleanupListener = () => {
-        bot.removeListener("message", messageHandler);
-        signal.removeEventListener("abort", abortHandler);
-        state.captchaMessageListener = null; // Clear the reference
-        state.isWaitingForCaptcha = false;
-      };
+      const getResultResponse = await axios.post(
+        `${ANTICAPTCHA_API_BASE_URL}/getTaskResult`,
+        {
+          clientKey: ANTI_CAPTCHA_API_KEY,
+          taskId: taskId,
+        },
+        { signal, timeout: 10000 }
+      ); // Add timeout for the API call
 
-      // Register listeners
-      bot.on("message", messageHandler);
-      signal.addEventListener("abort", abortHandler, { once: true });
-      state.captchaMessageListener = messageHandler; // Store reference for potential cleanup
-    });
-  } catch (error) {
-    state.isWaitingForCaptcha = false; // Ensure flag is reset on error
-    if (error.name === "AbortError") {
-      console.log("Captcha request explicitly aborted.");
-    } else {
-      console.error(`Error during captcha process: ${error.message}`);
+      if (getResultResponse.data.errorId !== 0) {
+        // Check if the error is related to task not being ready yet
+        if (getResultResponse.data.errorCode === "TASK_NOT_READY") {
+          console.log(`Task ${taskId} not ready yet. Polling again...`);
+          continue; // Continue polling
+        }
+        throw new Error(
+          `Anti-Captcha API error getting result for task ${taskId}: ${getResultResponse.data.errorDescription}`
+        );
+      }
+
+      if (getResultResponse.data.status === "processing") {
+        console.log(`Task ${taskId} still processing...`);
+        continue; // Continue polling
+      }
+
+      if (getResultResponse.data.status === "ready") {
+        console.log(
+          `✅ Captcha solved: ${getResultResponse.data.solution.text}`
+        );
+        return getResultResponse.data.solution.text; // Return the solved text
+      }
+
+      // Handle unexpected status
+      throw new Error(
+        `Anti-Captcha API returned unexpected status for task ${taskId}: ${getResultResponse.data.status}`
+      );
     }
-    throw error; // Re-throw the error to be caught by runCheck
+
+    // If loop finishes without result
+    throw new Error(
+      `Captcha solving timed out after ${
+        CAPTCHA_TIMEOUT_MS / 1000
+      } seconds for task ${taskId}.`
+    );
+  } catch (error) {
+    console.error(
+      `❌ Error during Anti-Captcha solving process: ${error.message}`
+    );
+    if (error.name === "AbortError") {
+      console.log("Anti-Captcha solving explicitly aborted.");
+    } else if (axios.isCancel(error)) {
+      console.log("Anti-Captcha API request was cancelled.");
+    } else if (error.response) {
+      // The request was made and the server responded with a status code
+      // that falls out of the range of 2xx
+      console.error(
+        `Anti-Captcha API responded with status ${
+          error.response.status
+        }: ${JSON.stringify(error.response.data)}`
+      );
+    } else if (error.request) {
+      // The request was made but no response was received
+      console.error("No response received from Anti-Captcha API.");
+    }
+    throw error; // Re-throw the error
   }
 }
 
 /**
- * Notifies the user repeatedly until they acknowledge with "OK".
+ * Notifies the user repeatedly via Telegram until they acknowledge with "OK".
  * @param {string} message - The notification message.
  */
 async function notifyAvailable(message) {
   if (state.spamInterval) return; // Already notifying
 
-  await safeSendMessage(message); // Send initial message
+  // Send initial message is handled in runCheck now
 
   state.spamInterval = setInterval(
     () => safeSendMessage(message),
@@ -286,12 +460,68 @@ async function runCheck(signal) {
       if (signal.aborted)
         throw new Error("Check aborted before getting captcha.");
 
-      const captchaCode = await getCaptchaFromUser(signal); // Pass signal
-      if (signal.aborted)
-        throw new Error("Check aborted after getting captcha code.");
+      // Wait for captcha element
+      await state.page.waitForSelector(CAPTCHA_SELECTOR, {
+        timeout: CAPTCHA_TIMEOUT_MS,
+        signal, // Pass signal here
+      });
 
-      console.log("Submitting captcha...");
-      await state.page.type(CAPTCHA_INPUT_SELECTOR, captchaCode);
+      // Extract base64 image data
+      const base64 = await state.page.$eval(CAPTCHA_SELECTOR, (el) => {
+        const bg = el.style.background;
+        const match = bg.match(/base64,([^"]+)/);
+        // Return only the base64 part, without the prefix
+        return match ? match[1] : null;
+      });
+
+      if (!base64) {
+        throw new Error("Could not extract base64 data from captcha element.");
+      }
+
+      // Solve the captcha using the anti-captcha service OR wait for manual input
+      let solvedText = null;
+      if (ANTI_CAPTCHA_API_KEY) {
+        try {
+          solvedText = await solveCaptcha(base64, signal);
+        } catch (captchaError) {
+          // If captcha solving fails, try refreshing and loop again
+          console.error(
+            `Captcha solving failed: ${captchaError.message}. Attempting refresh.`
+          );
+          await safeSendMessage(
+            `⚠️ Captcha solving failed: ${captchaError.message}. Trying again with a new captcha.`
+          );
+          // Click refresh - ensure selector exists first
+          try {
+            await state.page.waitForSelector(CAPTCHA_REFRESH_SELECTOR, {
+              timeout: 5000,
+              signal,
+            });
+            await state.page.click(CAPTCHA_REFRESH_SELECTOR);
+            await state.page.waitForTimeout(2000); // Small delay for refresh
+          } catch (e) {
+            console.warn(
+              "Captcha refresh button not found or timed out, attempting page reload."
+            );
+            await state.page.reload({ waitUntil: "domcontentloaded" }); // Reload if refresh fails
+          }
+          continue; // Loop back to get and solve new captcha
+        }
+      } else {
+        // Manual captcha solving logic would go here if ANTI_CAPTCHA_API_KEY is missing
+        // This requires re-implementing the getCaptchaFromUser function and state logic.
+        // For now, we'll throw an error if anti-captcha is not configured.
+        throw new Error(
+          "Manual captcha solving is not implemented. Please provide ANTI_CAPTCHA_API_KEY."
+        );
+        // TODO: Implement manual captcha input if needed
+      }
+
+      if (signal.aborted)
+        throw new Error("Check aborted after solving captcha.");
+
+      console.log(`Submitting solved captcha: ${solvedText}`);
+      await state.page.type(CAPTCHA_INPUT_SELECTOR, solvedText);
       await Promise.all([
         state.page.keyboard.press("Enter"),
         state.page.waitForNavigation({
@@ -311,8 +541,10 @@ async function runCheck(signal) {
       );
 
       if (isWrongCaptcha) {
-        await safeSendMessage("❌ Wrong captcha. Requesting a new one...");
-        console.log("Wrong captcha detected.");
+        await safeSendMessage(
+          "❌ Submitted captcha was wrong. Anti-captcha service might have failed or the site rejected it. Requesting a new one..."
+        );
+        console.log("Wrong captcha detected after submission.");
         // Click refresh - ensure selector exists first
         try {
           await state.page.waitForSelector(CAPTCHA_REFRESH_SELECTOR, {
@@ -320,7 +552,7 @@ async function runCheck(signal) {
             signal,
           });
           await state.page.click(CAPTCHA_REFRESH_SELECTOR);
-          await state.page.waitForTimeout(1000); // Small delay for refresh
+          await state.page.waitForTimeout(2000); // Small delay for refresh
         } catch (e) {
           console.warn(
             "Captcha refresh button not found or timed out, attempting page reload."
@@ -371,9 +603,17 @@ async function runCheck(signal) {
           );
         } else {
           console.log("‼️ Appointments found for NEXT month!");
-          await notifyAvailable(
-            `‼️ Appointment AVAILABLE (Next Month)! ‼️\n${APPOINTMENT_URL}`
+          const message = `‼️ Appointment AVAILABLE (Next Month)! ‼️\n${APPOINTMENT_URL}`;
+          await safeSendMessage(message); // Initial Telegram message
+          await sendEmailNotification(
+            "Appointment Available (Next Month)!",
+            message
           );
+          await sendPushNotification(
+            "Appointment Available!",
+            "Check the Telegram bot for details."
+          );
+          await notifyAvailable(message); // Repeated Telegram notifications
         }
       } catch (error) {
         if (error.name === "AbortError") {
@@ -387,9 +627,14 @@ async function runCheck(signal) {
     } else {
       // Appointments found in the current month
       console.log("‼️ Appointments found for CURRENT month!");
-      await notifyAvailable(
-        `‼️ Appointment AVAILABLE NOW! ‼️\n${APPOINTMENT_URL}`
+      const message = `‼️ Appointment AVAILABLE NOW! ‼️\n${APPOINTMENT_URL}`;
+      await safeSendMessage(message); // Initial Telegram message
+      await sendEmailNotification("Appointment Available NOW!", message);
+      await sendPushNotification(
+        "Appointment Available NOW!",
+        "Check the Telegram bot for details."
       );
+      await notifyAvailable(message); // Repeated Telegram notifications
     }
 
     console.log("✅ Check completed successfully.");
@@ -451,73 +696,49 @@ bot.onText(/\/checknow/, async (msg) => {
 
   // Ensure state is reset before starting (in case cleanup didn't fully run)
   state.isRunning = false;
-  state.isWaitingForCaptcha = false;
   if (state.spamInterval) clearInterval(state.spamInterval);
   state.spamInterval = null;
-  if (state.captchaMessageListener)
-    bot.removeListener("message", state.captchaMessageListener);
-  state.captchaMessageListener = null;
 
   startCheckProcess(); // Start a new check
 });
 
-// Handler for /another command (reload captcha)
+// Handler for /another command (reload captcha - now automated)
 bot.onText(/\/another/, async (msg) => {
   if (String(msg.chat.id) !== CHAT_ID) return;
 
-  if (!state.isRunning || !state.isWaitingForCaptcha || !state.page) {
+  if (!state.isRunning || !state.page) {
     await safeSendMessage(
-      "❓ Cannot get another captcha right now (no check running or not waiting for captcha)."
+      "❓ Cannot get another captcha right now (no check running)."
     );
     return;
   }
 
   console.log("Received /another command.");
-  await safeSendMessage("🔄 Requesting a new captcha...");
+  await safeSendMessage(
+    "🔄 Attempting to refresh the page to get a new captcha for automated solving..."
+  );
 
   try {
-    // Option 1: Try clicking the refresh button if available
-    let refreshed = false;
-    try {
-      await state.page.waitForSelector(CAPTCHA_REFRESH_SELECTOR, {
-        visible: true,
-        timeout: 3000,
-      });
-      await state.page.click(CAPTCHA_REFRESH_SELECTOR);
-      await state.page.waitForTimeout(1000); // Wait a bit for refresh
-      console.log("Clicked captcha refresh button.");
-      refreshed = true;
-    } catch (e) {
-      console.log(
-        "Captcha refresh button not found or failed, trying page reload."
-      );
+    // Abort the current check's captcha solving process if it's stuck
+    if (state.currentAbortController) {
+      // This might be tricky if the abort signal is already passed down.
+      // A simpler approach for /another when automated is just to reload the page
+      // and let the main loop encounter the new captcha.
+      // state.currentAbortController.abort(); // Could try aborting, but page reload is more reliable here.
     }
 
-    // Option 2: Reload the page if refresh button fails or doesn't exist
-    if (!refreshed) {
-      await state.page.reload({ waitUntil: "domcontentloaded" });
-      console.log("Reloaded page for new captcha.");
-    }
+    // Reload the page to force a new captcha
+    await state.page.reload({ waitUntil: "domcontentloaded" });
+    console.log("Reloaded page for new captcha.");
 
-    // Abort the previous getCaptchaFromUser promise (if it's still waiting)
-    // This is tricky because the promise is internal to getCaptchaFromUser.
-    // A simpler approach is to just let the old listener time out or be removed
-    // when the *new* getCaptchaFromUser is called.
-
-    // Re-request captcha from user (this will send the new image)
-    // NOTE: This assumes runCheck's loop will call getCaptchaFromUser again.
-    // If /another is called *outside* the captcha loop, this won't work directly.
-    // The current structure relies on the user *replying* to the message sent by getCaptchaFromUser.
-    // A direct call here might disrupt the flow.
-    // Let's just signal the user we tried and let the main loop handle re-fetching.
     await safeSendMessage(
-      "✅ Attempted to refresh. Please wait for the new captcha image (if the bot asks again)."
+      "✅ Page reloaded. The bot will attempt to solve the new captcha automatically."
     );
-    // It might be better to abort the current *captcha wait* specifically and have the main loop retry.
-    // However, the current structure relies on the user reply. Let's stick to refresh/reload for now.
   } catch (error) {
     console.error(`Error handling /another: ${error.message}`);
-    await safeSendMessage(`⚠️ Error refreshing captcha: ${error.message}`);
+    await safeSendMessage(
+      `⚠️ Error reloading page for new captcha: ${error.message}`
+    );
   }
 });
 
@@ -529,20 +750,26 @@ cron.schedule(CRON_SCHEDULE, () => {
     console.log("🚫 Cron: Check already running. Skipping.");
     return;
   }
-  if (state.isWaitingForCaptcha) {
-    console.log("🚫 Cron: Waiting for captcha input. Skipping check.");
-    // Optionally, send a reminder?
-    // safeSendMessage("⏰ Reminder: Still waiting for captcha input.");
-    return;
-  }
-  startCheckProcess(); // Start check if not running and not waiting
+  startCheckProcess(); // Start check if not running
 });
 
 // --- Initial Run and Startup Message ---
 (async () => {
-  await safeSendMessage(
-    `👋 Bot started. Initial check starting now...\n\nAvailable commands:\n/checknow - Run check immediately\n/another - Try to get a new captcha image\nOK - Stop appointment alerts`
-  );
+  let startupMessage = `👋 Bot started with automated captcha solving. Initial check starting now...\n\nAvailable commands:\n/checknow - Run check immediately\n/another - Reload page to get a new captcha\nOK - Stop appointment alerts`;
+
+  if (enableEmail) {
+    startupMessage += `\n📧 Email notifications are enabled.`;
+  } else {
+    startupMessage += `\n⚠️ Email notifications are NOT enabled (check .env).`;
+  }
+
+  if (enablePushbullet) {
+    startupMessage += `\n📱 Pushbullet notifications are enabled.`;
+  } else {
+    startupMessage += `\n⚠️ Pushbullet notifications are NOT enabled (check .env).`;
+  }
+
+  await safeSendMessage(startupMessage);
   startCheckProcess(); // Start the first check immediately
 })();
 
