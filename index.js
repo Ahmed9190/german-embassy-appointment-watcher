@@ -745,7 +745,7 @@ async function runCheck(signal) {
     if (signal.aborted)
       throw new Error("Check aborted after checking current month.");
 
-    if (false && noAppointmentsThisMonth) {
+    if (noAppointmentsThisMonth) {
       console.log("No appointments found this month. Checking next month...");
       // 5. Check Next Month
       try {
