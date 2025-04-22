@@ -5,6 +5,7 @@ import puppeteer from "puppeteer";
 import { Buffer } from "node:buffer"; // Explicit import for Buffer
 import axios from "axios"; // Import axios for API calls
 import nodemailer from "nodemailer"; // Import nodemailer for email
+import moment from "moment-timezone"; // Import moment-timezone
 
 // --- Constants ---
 const CAPTCHA_TIMEOUT_MS = 60 * 1000; // Increased timeout for anti-captcha service (also used for manual captcha wait)
@@ -25,6 +26,10 @@ const NEXT_MONTH_BUTTON_SELECTOR =
 const NO_APPOINTMENTS_TEXT = "Unfortunately, there are no appointments";
 const WRONG_CAPTCHA_TEXT = "The entered text was wrong";
 
+// Restricted Time Window (Local Time)
+const RESTRICTED_START_HOUR = 1; // 1 AM
+const RESTRICTED_END_HOUR = 10; // 10 AM
+
 // Anti-Captcha Constants
 const ANTICAPTCHA_API_BASE_URL = "https://api.anti-captcha.com";
 const ANTICAPTCHA_TASK_TYPE = "ImageToTextTask"; // Type for image captchas
@@ -42,6 +47,7 @@ const {
   EMAIL_PASSWORD, // Use an App Password if using Gmail
   EMAIL_RECIPIENT,
   PUSHBULLET_API_KEY,
+  TIMEZONE, // New TIMEZONE environment variable
 } = process.env;
 
 if (!BOT_TOKEN || !CHAT_ID) {
@@ -55,6 +61,7 @@ if (!BOT_TOKEN || !CHAT_ID) {
 const enableAntiCaptcha = !!ANTI_CAPTCHA_API_KEY;
 const enableEmail = EMAIL_SENDER && EMAIL_PASSWORD && EMAIL_RECIPIENT;
 const enablePushbullet = PUSHBULLET_API_KEY;
+const enableTimezoneRestriction = !!TIMEZONE;
 
 if (!enableAntiCaptcha) {
   console.warn(
@@ -70,6 +77,19 @@ if (!enablePushbullet) {
   console.warn(
     "Warning: Pushbullet notifications are not configured (PUSHBULLET_API_KEY is required)."
   );
+}
+if (!enableTimezoneRestriction) {
+  console.warn(
+    "Warning: TIMEZONE environment variable is not set. Time restriction will use server's local time."
+  );
+} else {
+  // Validate timezone string
+  if (!moment.tz.zone(TIMEZONE)) {
+    console.error(
+      `Error: Invalid TIMEZONE specified: ${TIMEZONE}. Please use a valid IANA timezone name (e.g., 'Europe/Berlin').`
+    );
+    process.exit(1); // Exit if timezone is invalid
+  }
 }
 
 // --- Bot Initialization ---
@@ -87,6 +107,46 @@ if (enableEmail) {
   });
 }
 
+// --- Console to Telegram Logging ---
+// Store original console methods
+const originalConsoleLog = console.log;
+const originalConsoleWarn = console.warn;
+const originalConsoleError = console.error;
+
+// Override console methods
+console.log = (...args) => {
+  const message = args
+    .map((arg) => (typeof arg === "object" ? JSON.stringify(arg) : arg))
+    .join(" ");
+  originalConsoleLog(...args); // Log to console
+  // Send to Telegram, but avoid sending during sensitive operations like captcha input
+  // and avoid sending the notification messages themselves repeatedly.
+  // Also, avoid sending messages that are too long for Telegram.
+  if (!state.isWaitingForCaptcha && !state.spamInterval) {
+    // Only send if not waiting for captcha or actively spamming notifications
+    const telegramMessage = `[LOG] ${message}`.substring(0, 4000); // Limit message length
+    safeSendMessage(telegramMessage);
+  }
+};
+
+console.warn = (...args) => {
+  const message = args
+    .map((arg) => (typeof arg === "object" ? JSON.stringify(arg) : arg))
+    .join(" ");
+  originalConsoleWarn(...args); // Log to console
+  const telegramMessage = `[WARN] ${message}`.substring(0, 4000); // Limit message length
+  safeSendMessage(telegramMessage); // Always send warnings
+};
+
+console.error = (...args) => {
+  const message = args
+    .map((arg) => (typeof arg === "object" ? JSON.stringify(arg) : arg))
+    .join(" ");
+  originalConsoleError(...args); // Log to console
+  const telegramMessage = `[ERROR] ${message}`.substring(0, 4000); // Limit message length
+  safeSendMessage(telegramMessage); // Always send errors
+};
+
 // --- State Management ---
 let state = {
   isRunning: false, // Is a check currently running?
@@ -103,14 +163,50 @@ let state = {
 // --- Helper Functions ---
 
 /**
+ * Checks if the current time in the specified timezone is within the restricted hours (1 AM to 10 AM).
+ * Uses the TIMEZONE environment variable if set, otherwise uses local time.
+ * @returns {boolean} True if within restricted hours, false otherwise.
+ */
+function isWithinRestrictedHours() {
+  const now = enableTimezoneRestriction ? moment().tz(TIMEZONE) : moment(); // Use moment with timezone if enabled
+  const currentHour = now.hours(); // Get hour (0-23)
+
+  // Check if current hour is between RESTRICTED_START_HOUR (inclusive) and RESTRICTED_END_HOUR (exclusive)
+  return (
+    currentHour >= RESTRICTED_START_HOUR && currentHour < RESTRICTED_END_HOUR
+  );
+}
+
+/**
+ * Gets the current time string, including timezone information if enabled.
+ * @returns {string} The formatted current time string.
+ */
+function getCurrentTimeString() {
+  const now = enableTimezoneRestriction ? moment().tz(TIMEZONE) : moment();
+  return enableTimezoneRestriction
+    ? `${now.format("YYYY-MM-DD HH:mm:ss")} ${now.tz()}`
+    : now.format("YYYY-MM-DD HH:mm:ss [Local]");
+}
+
+/**
  * Sends a message safely, catching potential Telegram API errors.
  * @param {string} text - The message text.
  */
 async function safeSendMessage(text) {
   try {
+    // Ensure text is a string and not empty before sending
+    if (typeof text !== "string" || text.trim() === "") {
+      originalConsoleWarn(
+        "Attempted to send empty or non-string message to Telegram."
+      );
+      return;
+    }
     await bot.sendMessage(CHAT_ID, text);
   } catch (error) {
-    console.error(`Failed to send message: ${error.message}`);
+    // Log the error to the original console to avoid infinite loops
+    originalConsoleError(
+      `Failed to send message to Telegram: ${error.message}`
+    );
   }
 }
 
@@ -123,7 +219,8 @@ async function safeSendPhoto(photoBuffer, options) {
   try {
     await bot.sendPhoto(CHAT_ID, photoBuffer, options);
   } catch (error) {
-    console.error(`Failed to send photo: ${error.message}`);
+    // Log the error to the original console to avoid infinite loops
+    originalConsoleError(`Failed to send photo to Telegram: ${error.message}`);
   }
 }
 
@@ -513,6 +610,7 @@ async function notifyAvailable(message) {
         state.notifyAvailableResolver();
         state.notifyAvailableResolver = null;
       }
+      console.log("Repeated notifications stopped.");
     };
 
     // Send the first notification immediately
@@ -771,7 +869,7 @@ async function runCheck(signal) {
         if (noAppointmentsNextMonth) {
           console.log("No appointments found next month either.");
           await safeSendMessage(
-            `→ No appointments found for this or next month (${new Date().toLocaleString()}). Retrying in 30 minutes.`
+            `→ No appointments found for this or next month (${getCurrentTimeString()}). Retrying in 30 minutes.`
           );
         } else {
           console.log("‼️ Appointments found for NEXT month!");
@@ -826,6 +924,22 @@ async function startCheckProcess() {
     return;
   }
 
+  // Check if within restricted hours before starting
+  if (isWithinRestrictedHours()) {
+    const currentTime = getCurrentTimeString();
+    console.log(
+      `🚫 Cannot start check. Currently within restricted hours (${RESTRICTED_START_HOUR} AM to ${RESTRICTED_END_HOUR} AM ${
+        enableTimezoneRestriction ? TIMEZONE : "local time"
+      }). Current time: ${currentTime}`
+    );
+    await safeSendMessage(
+      `🚫 Cannot start check now. The bot is restricted from running between ${RESTRICTED_START_HOUR} AM and ${RESTRICTED_END_HOUR} AM ${
+        enableTimezoneRestriction ? TIMEZONE : "local time"
+      }. Current time: ${currentTime}`
+    );
+    return;
+  }
+
   // Create a new AbortController for this check
   state.currentAbortController = new AbortController();
   // Run the check, passing the signal
@@ -836,8 +950,25 @@ async function startCheckProcess() {
 bot.onText(/\/checknow/, async (msg) => {
   if (String(msg.chat.id) !== CHAT_ID) return;
 
-  await safeSendMessage("🔍 Starting the check now. Please wait...");
   console.log("Received /checknow command.");
+
+  // Check if within restricted hours before starting
+  if (isWithinRestrictedHours()) {
+    const currentTime = getCurrentTimeString();
+    console.log(
+      `🚫 Cannot start check via /checknow. Currently within restricted hours (${RESTRICTED_START_HOUR} AM to ${RESTRICTED_END_HOUR} AM ${
+        enableTimezoneRestriction ? TIMEZONE : "local time"
+      }). Current time: ${currentTime}`
+    );
+    await safeSendMessage(
+      `🚫 Cannot start check now via /checknow. The bot is restricted from running between ${RESTRICTED_START_HOUR} AM and ${RESTRICTED_END_HOUR} AM ${
+        enableTimezoneRestriction ? TIMEZONE : "local time"
+      }. Current time: ${currentTime}`
+    );
+    return;
+  }
+
+  await safeSendMessage("🔍 Starting the check now. Please wait...");
 
   if (state.isRunning) {
     console.log("⚠️ Check is running. Aborting previous check...");
@@ -919,9 +1050,26 @@ bot.onText(/\/another/, async (msg) => {
 });
 
 // --- Cron Job Scheduling ---
-console.log(`Scheduling check with cron schedule: "${CRON_SCHEDULE}"`);
+console.log(
+  `Scheduling check with cron schedule: "${CRON_SCHEDULE}". Checks restricted between ${RESTRICTED_START_HOUR} AM and ${RESTRICTED_END_HOUR} AM ${
+    enableTimezoneRestriction ? TIMEZONE : "local time"
+  }.`
+);
 cron.schedule(CRON_SCHEDULE, () => {
   console.log("⏰ Cron job triggered.");
+
+  // Check if within restricted hours before starting
+  if (isWithinRestrictedHours()) {
+    const currentTime = getCurrentTimeString();
+    console.log(
+      `🚫 Cron skipped. Currently within restricted hours (${RESTRICTED_START_HOUR} AM to ${RESTRICTED_END_HOUR} AM ${
+        enableTimezoneRestriction ? TIMEZONE : "local time"
+      }). Current time: ${currentTime}`
+    );
+    // No need to send Telegram message for every skipped cron run
+    return;
+  }
+
   if (state.isRunning) {
     console.log("🚫 Cron: Check already running. Skipping.");
     return;
@@ -957,8 +1105,13 @@ cron.schedule(CRON_SCHEDULE, () => {
     startupMessage += `\n⚠️ Pushbullet notifications are NOT enabled (check .env).`;
   }
 
+  startupMessage += `\n\nChecks are restricted between ${RESTRICTED_START_HOUR} AM and ${RESTRICTED_END_HOUR} AM ${
+    enableTimezoneRestriction ? TIMEZONE : "local time"
+  }.`;
+
   await safeSendMessage(startupMessage);
-  startCheckProcess(); // Start the first check immediately
+  // Start the first check immediately, but it will be skipped if within restricted hours
+  startCheckProcess();
 })();
 
 console.log("🤖 Telegram bot polling started...");
