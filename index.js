@@ -9,7 +9,7 @@ import moment from "moment-timezone"; // Import moment-timezone
 
 // --- Constants ---
 const CAPTCHA_TIMEOUT_MS = 60 * 1000; // Increased timeout for anti-captcha service (also used for manual captcha wait)
-const PAGE_NAVIGATION_TIMEOUT_MS = 29 * 60 * 1000; // 29 minutes
+const PAGE_NAVIGATION_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
 const NOTIFICATION_INTERVAL_MS = 5 * 1000; // 5 seconds (for repeated notifications)
 const MAX_NOTIFICATIONS = 50; // Maximum number of repeated notifications (Telegram, Email, Pushbullet combined in interval)
 const EMAIL_NOTIFICATION_FREQUENCY = 10; // Send email every X notifications
@@ -32,6 +32,13 @@ const DEFAULT_WORKING_START_HOUR = 10; // 10 AM
 const DEFAULT_WORKING_START_MINUTE = 0; // 00 minutes
 const DEFAULT_WORKING_END_HOUR = 1; // 1 AM
 const DEFAULT_WORKING_END_MINUTE = 0; // 00 minutes
+
+// Puppeteer Protocol Timeout (Increased for stability)
+const PUPPETEER_PROTOCOL_TIMEOUT_MS = 180000; // 3 minutes
+
+// Retry Configuration for runCheck
+const MAX_CHECK_RETRIES = 3; // Number of times to retry a failed check
+const CHECK_RETRY_DELAY_MS = 10000; // 10 seconds delay between retries
 
 // Anti-Captcha Constants
 const ANTICAPTCHA_API_BASE_URL = "https://api.anti-captcha.com";
@@ -693,16 +700,13 @@ async function checkForNoAppointments() {
   }
 }
 
-// --- Main Check Logic ---
-
 /**
  * The core routine to check for appointment availability.
  * Handles browser launch, navigation, captcha solving, and checking.
  * @param {AbortSignal} signal - The AbortSignal to allow cancellation.
  */
-async function runCheck(signal) {
-  console.log("🚀 Starting appointment check...");
-  state.isRunning = true;
+async function runCheckLogic(signal) {
+  console.log("🚀 Starting appointment check logic...");
 
   try {
     // 1. Initialize Browser and Page
@@ -710,6 +714,7 @@ async function runCheck(signal) {
     state.browser = await puppeteer.launch({
       headless: "new", // Use "new" headless mode
       args: ["--no-sandbox", "--disable-setuid-sandbox"], // Add necessary arguments
+      protocolTimeout: PUPPETEER_PROTOCOL_TIMEOUT_MS, // Increased timeout for protocol operations
     });
     state.page = await state.browser.newPage();
     await state.page.setUserAgent(
@@ -915,20 +920,85 @@ async function runCheck(signal) {
 
     console.log("✅ Check completed successfully.");
   } catch (error) {
+    // This catch block is for errors *within* a single check attempt
     if (error.message.includes("aborted")) {
-      console.log(`🏃 Check was aborted: ${error.message}`);
+      console.log(`🏃 Check logic was aborted: ${error.message}`);
       // No message to user needed if aborted intentionally
     } else {
-      console.error(`❌ Error during appointment check: ${error.message}`);
-      console.error(error.stack); // Log stack trace for debugging
-      await safeSendMessage(
-        `❌ Bot error during check: ${error.message}. Please check logs.`
+      console.error(
+        `❌ Error during appointment check logic: ${error.message}`
       );
+      console.error(error.stack); // Log stack trace for debugging
+      throw error; // Re-throw to be caught by the retry logic
     }
   } finally {
-    // 6. Cleanup
+    // Cleanup resources after each attempt (successful or failed)
     await cleanupResources();
   }
+}
+
+/**
+ * Runs the appointment check with retry logic.
+ * @param {AbortSignal} signal - The AbortSignal to allow cancellation.
+ */
+async function runCheck(signal) {
+  state.isRunning = true;
+  let attempt = 0;
+  let lastError = null;
+
+  while (attempt < MAX_CHECK_RETRIES) {
+    if (signal.aborted) {
+      console.log("Check aborted before retry.");
+      state.isRunning = false; // Ensure state is updated
+      return; // Exit retry loop if aborted
+    }
+
+    console.log(
+      `Attempt ${attempt + 1} of ${MAX_CHECK_RETRIES} to run check logic.`
+    );
+    try {
+      await runCheckLogic(signal);
+      console.log("Check logic completed successfully.");
+      state.isRunning = false; // Mark as not running on success
+      return; // Exit loop on success
+    } catch (error) {
+      lastError = error;
+      console.error(`Attempt ${attempt + 1} failed: ${error.message}`);
+
+      // Only retry on specific Puppeteer ProtocolErrors or general Errors
+      if (error.name === "ProtocolError" || error instanceof Error) {
+        attempt++;
+        if (attempt < MAX_CHECK_RETRIES) {
+          console.log(`Retrying in ${CHECK_RETRY_DELAY_MS / 1000} seconds...`);
+          await safeSendMessage(
+            `⚠️ Check attempt ${attempt} failed with error: ${
+              error.message
+            }. Retrying in ${CHECK_RETRY_DELAY_MS / 1000} seconds...`
+          );
+          await new Promise((resolve) =>
+            setTimeout(resolve, CHECK_RETRY_DELAY_MS)
+          );
+        }
+      } else {
+        // If it's not a ProtocolError or general Error, don't retry
+        console.error(`Non-retryable error occurred: ${error.message}`);
+        await safeSendMessage(
+          `❌ Bot error during check (non-retryable): ${error.message}. Please check logs.`
+        );
+        state.isRunning = false; // Mark as not running on non-retryable error
+        return; // Exit loop on non-retryable error
+      }
+    }
+  }
+
+  // If loop finishes without success
+  console.error(`❌ All ${MAX_CHECK_RETRIES} check attempts failed.`);
+  await safeSendMessage(
+    `❌ All ${MAX_CHECK_RETRIES} check attempts failed. Last error: ${
+      lastError?.message || "Unknown error"
+    }. Please check logs.`
+  );
+  state.isRunning = false; // Mark as not running after all attempts fail
 }
 
 // --- Bot Command Handlers ---
