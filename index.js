@@ -20,15 +20,18 @@ const APPOINTMENT_URL =
 const CAPTCHA_SELECTOR =
   "#appointment_captcha_month > div:nth-child(1) > captcha > div";
 const CAPTCHA_INPUT_SELECTOR = "#appointment_captcha_month_captchaText";
-const CAPTCHA_REFRESH_SELECTOR = "#appointment_captcha_month_refreshcaptcha";
+const CAPTCHA_REFRESH_SELECTOR = "#appointment_captcha_month_refreshcaptcha"; // Still needed for error handling fallback
 const NEXT_MONTH_BUTTON_SELECTOR =
   "#content > div.wrapper > h2:nth-child(3) > a:nth-child(2)";
 const NO_APPOINTMENTS_TEXT = "Unfortunately, there are no appointments";
 const WRONG_CAPTCHA_TEXT = "The entered text was wrong";
 
-// Restricted Time Window (Local Time)
-const RESTRICTED_START_HOUR = 1; // 1 AM
-const RESTRICTED_END_HOUR = 10; // 10 AM
+// Default Working Time Window (Local Time) - Used if not set by commands
+// Working from 10:00 AM to 1:00 AM
+const DEFAULT_WORKING_START_HOUR = 10; // 10 AM
+const DEFAULT_WORKING_START_MINUTE = 0; // 00 minutes
+const DEFAULT_WORKING_END_HOUR = 1; // 1 AM
+const DEFAULT_WORKING_END_MINUTE = 0; // 00 minutes
 
 // Anti-Captcha Constants
 const ANTICAPTCHA_API_BASE_URL = "https://api.anti-captcha.com";
@@ -119,11 +122,12 @@ console.log = (...args) => {
     .map((arg) => (typeof arg === "object" ? JSON.stringify(arg) : arg))
     .join(" ");
   originalConsoleLog(...args); // Log to console
-  // Send to Telegram, but avoid sending during sensitive operations like captcha input
-  // and avoid sending the notification messages themselves repeatedly.
-  // Also, avoid sending messages that are too long for Telegram.
-  if (!state.isWaitingForCaptcha && !state.spamInterval) {
-    // Only send if not waiting for captcha or actively spamming notifications
+  // Send to Telegram ONLY if logging is enabled and not during sensitive operations
+  if (
+    state.isLoggingEnabled &&
+    !state.isWaitingForCaptcha &&
+    !state.spamInterval
+  ) {
     const telegramMessage = `[LOG] ${message}`.substring(0, 4000); // Limit message length
     safeSendMessage(telegramMessage);
   }
@@ -158,23 +162,50 @@ let state = {
   currentAbortController: null, // AbortController for the current check
   // Promise resolver for notifyAvailable, allows runCheck to wait
   notifyAvailableResolver: null,
+  // Dynamic working time
+  workingStartHour: DEFAULT_WORKING_START_HOUR,
+  workingStartMinute: DEFAULT_WORKING_START_MINUTE,
+  workingEndHour: DEFAULT_WORKING_END_HOUR,
+  workingEndMinute: DEFAULT_WORKING_END_MINUTE,
+  isLoggingEnabled: true, // New state variable for toggling logs
 };
 
 // --- Helper Functions ---
 
 /**
- * Checks if the current time in the specified timezone is within the restricted hours (1 AM to 10 AM).
+ * Checks if the current time in the specified timezone is within the working period.
  * Uses the TIMEZONE environment variable if set, otherwise uses local time.
- * @returns {boolean} True if within restricted hours, false otherwise.
+ * Uses dynamic working hours/minutes if set by commands, otherwise uses defaults.
+ * @returns {boolean} True if within working hours, false otherwise.
  */
-function isWithinRestrictedHours() {
+function isWithinWorkingHours() {
   const now = enableTimezoneRestriction ? moment().tz(TIMEZONE) : moment(); // Use moment with timezone if enabled
-  const currentHour = now.hours(); // Get hour (0-23)
 
-  // Check if current hour is between RESTRICTED_START_HOUR (inclusive) and RESTRICTED_END_HOUR (exclusive)
-  return (
-    currentHour >= RESTRICTED_START_HOUR && currentHour < RESTRICTED_END_HOUR
-  );
+  const startMoment = enableTimezoneRestriction
+    ? moment.tz(
+        { hour: state.workingStartHour, minute: state.workingStartMinute },
+        TIMEZONE
+      )
+    : moment({
+        hour: state.workingStartHour,
+        minute: state.workingStartMinute,
+      });
+
+  const endMoment = enableTimezoneRestriction
+    ? moment.tz(
+        { hour: state.workingEndHour, minute: state.workingEndMinute },
+        TIMEZONE
+      )
+    : moment({ hour: state.workingEndHour, minute: state.workingEndMinute });
+
+  // Handle cases where the working period spans across midnight
+  if (startMoment.isAfter(endMoment)) {
+    // Working hours are from startMoment to endMoment (next day)
+    return now.isSameOrAfter(startMoment) || now.isBefore(endMoment);
+  } else {
+    // Working hours are from startMoment to endMoment (same day)
+    return now.isSameOrAfter(startMoment) && now.isBefore(endMoment);
+  }
 }
 
 /**
@@ -359,8 +390,7 @@ async function getCaptchaFromUser(signal) {
 
     // Send captcha photo to user
     await safeSendPhoto(buf, {
-      caption:
-        "🖼️ New captcha. Reply with the text.\nUse /another to get a new one.",
+      caption: "🖼️ New captcha. Reply with the text.", // Removed /another from caption
     });
 
     // Wait for user's reply
@@ -711,11 +741,14 @@ async function runCheck(signal) {
     if (signal.aborted) throw new Error("Check aborted after navigation.");
 
     // 3. Solve Captcha Loop
-    while (true) {
+    let captchaAttempts = 0;
+    const MAX_CAPTCHA_ATTEMPTS = 5; // Limit attempts to avoid infinite loops
+
+    while (captchaAttempts < MAX_CAPTCHA_ATTEMPTS) {
       if (signal.aborted)
         throw new Error("Check aborted before getting captcha.");
 
-      // Wait for captcha element
+      // Wait for captcha element (this will wait for the initial or a new captcha after wrong input)
       await state.page.waitForSelector(CAPTCHA_SELECTOR, {
         timeout: CAPTCHA_TIMEOUT_MS,
         signal, // Pass signal here
@@ -739,28 +772,15 @@ async function runCheck(signal) {
         try {
           solvedText = await solveCaptcha(base64, signal);
         } catch (captchaError) {
-          // If captcha solving fails, try refreshing and loop again
+          // If anti-captcha solving fails, log and retry the loop (which will get the same captcha)
           console.error(
-            `Captcha solving failed: ${captchaError.message}. Attempting refresh.`
+            `Captcha solving failed: ${captchaError.message}. Retrying...`
           );
           await safeSendMessage(
-            `⚠️ Captcha solving failed: ${captchaError.message}. Trying again with a new captcha.`
+            `⚠️ Captcha solving failed: ${captchaError.message}. Retrying with the same captcha.`
           );
-          // Click refresh - ensure selector exists first
-          try {
-            await state.page.waitForSelector(CAPTCHA_REFRESH_SELECTOR, {
-              timeout: 5000,
-              signal,
-            });
-            await state.page.click(CAPTCHA_REFRESH_SELECTOR);
-            await state.page.waitForTimeout(2000); // Small delay for refresh
-          } catch (e) {
-            console.warn(
-              "Captcha refresh button not found or timed out, attempting page reload."
-            );
-            await state.page.reload({ waitUntil: "domcontentloaded" }); // Reload if refresh fails
-          }
-          continue; // Loop back to get and solve new captcha
+          captchaAttempts++; // Increment attempt counter on failure
+          continue; // Loop back to try solving the same captcha again
         }
       } else {
         // Manual captcha solving
@@ -774,7 +794,7 @@ async function runCheck(signal) {
           await safeSendMessage(
             `⚠️ Failed to get manual captcha input: ${captchaError.message}. Please try again.`
           );
-          // Attempt to reload page to get a new captcha for manual input
+          // Attempt to reload page to get a new captcha for manual input as a fallback
           try {
             await state.page.reload({ waitUntil: "domcontentloaded" });
             console.log("Reloaded page for new manual captcha.");
@@ -783,6 +803,7 @@ async function runCheck(signal) {
               `Error reloading page after manual captcha failure: ${reloadError.message}`
             );
           }
+          captchaAttempts++; // Increment attempt counter on failure
           continue; // Loop back to ask for captcha again
         }
       }
@@ -811,29 +832,26 @@ async function runCheck(signal) {
       );
 
       if (isWrongCaptcha) {
-        await safeSendMessage(
-          `❌ Submitted captcha "${solvedText}" was wrong. Requesting a new one...`
+        console.log(
+          `❌ Submitted captcha "${solvedText}" was wrong. The website should show a new one.`
         );
-        console.log("Wrong captcha detected after submission.");
-        // Click refresh - ensure selector exists first
-        try {
-          await state.page.waitForSelector(CAPTCHA_REFRESH_SELECTOR, {
-            timeout: 5000,
-            signal,
-          });
-          await state.page.click(CAPTCHA_REFRESH_SELECTOR);
-          await state.page.waitForTimeout(2000); // Small delay for refresh
-        } catch (e) {
-          console.warn(
-            "Captcha refresh button not found or timed out, attempting page reload."
-          );
-          await state.page.reload({ waitUntil: "domcontentloaded" }); // Reload if refresh fails
-        }
-        continue; // Loop back to get new captcha
+        await safeSendMessage(
+          `❌ Submitted captcha "${solvedText}" was wrong. The website should have loaded a new captcha. Attempting to solve the new one.`
+        );
+        captchaAttempts++; // Increment attempt counter on wrong captcha
+        // The loop will continue, wait for the new CAPTCHA_SELECTOR, and try again
+        continue;
       }
 
       console.log("✅ Captcha accepted.");
       break; // Exit loop if captcha is correct
+    }
+
+    // Check if we exited the loop due to max attempts
+    if (captchaAttempts >= MAX_CAPTCHA_ATTEMPTS) {
+      throw new Error(
+        `Failed to solve captcha after ${MAX_CAPTCHA_ATTEMPTS} attempts.`
+      );
     }
 
     // 4. Check for Appointments (Current Month)
@@ -854,6 +872,7 @@ async function runCheck(signal) {
         await new Promise((resolve) => setTimeout(resolve, 1000)); // Small delay
         await state.page.click(NEXT_MONTH_BUTTON_SELECTOR);
         await state.page.waitForNetworkIdle({
+          waitUntil: "domcontentloaded", // Wait for DOM content
           timeout: CAPTCHA_TIMEOUT_MS,
           signal,
         }); // Wait for potential AJAX loads
@@ -916,27 +935,35 @@ async function runCheck(signal) {
 
 /**
  * Initiates a check process, handling potential existing runs.
+ * @param {boolean} [bypassTimeCheck=false] - Whether to bypass the working time check.
  */
-async function startCheckProcess() {
+async function startCheckProcess(bypassTimeCheck = false) {
   if (state.isRunning) {
     console.log("🚫 Check already in progress. Ignoring request.");
     await safeSendMessage("⏳ A check is already running. Please wait.");
     return;
   }
 
-  // Check if within restricted hours before starting
-  if (isWithinRestrictedHours()) {
+  // Check if within working hours before starting, unless bypassing
+  // The cron job and non-bypassing calls should only run *within* working hours.
+  if (!bypassTimeCheck && !isWithinWorkingHours()) {
     const currentTime = getCurrentTimeString();
+    const workingPeriod = `${String(state.workingStartHour).padStart(
+      2,
+      "0"
+    )}:${String(state.workingStartMinute).padStart(2, "0")} to ${String(
+      state.workingEndHour
+    ).padStart(2, "0")}:${String(state.workingEndMinute).padStart(2, "0")}`;
     console.log(
-      `🚫 Cannot start check. Currently within restricted hours (${RESTRICTED_START_HOUR} AM to ${RESTRICTED_END_HOUR} AM ${
+      `🚫 Cannot start scheduled check. Currently outside working hours (${workingPeriod} ${
         enableTimezoneRestriction ? TIMEZONE : "local time"
       }). Current time: ${currentTime}`
     );
-    await safeSendMessage(
-      `🚫 Cannot start check now. The bot is restricted from running between ${RESTRICTED_START_HOUR} AM and ${RESTRICTED_END_HOUR} AM ${
-        enableTimezoneRestriction ? TIMEZONE : "local time"
-      }. Current time: ${currentTime}`
-    );
+    // Only send a message if logging is enabled to avoid spam during off-hours
+    if (state.isLoggingEnabled) {
+      // Optional: send a message indicating cron was skipped due to working hours
+      // await safeSendMessage(`⏰ Cron check skipped. Currently outside working hours (${workingPeriod}).`);
+    }
     return;
   }
 
@@ -946,30 +973,13 @@ async function startCheckProcess() {
   runCheck(state.currentAbortController.signal);
 }
 
-// Handler for /checknow command
+// Handler for /checknow command (bypasses working time restriction)
 bot.onText(/\/checknow/, async (msg) => {
   if (String(msg.chat.id) !== CHAT_ID) return;
 
   console.log("Received /checknow command.");
 
-  // Check if within restricted hours before starting
-  if (isWithinRestrictedHours()) {
-    const currentTime = getCurrentTimeString();
-    console.log(
-      `🚫 Cannot start check via /checknow. Currently within restricted hours (${RESTRICTED_START_HOUR} AM to ${RESTRICTED_END_HOUR} AM ${
-        enableTimezoneRestriction ? TIMEZONE : "local time"
-      }). Current time: ${currentTime}`
-    );
-    await safeSendMessage(
-      `🚫 Cannot start check now via /checknow. The bot is restricted from running between ${RESTRICTED_START_HOUR} AM and ${RESTRICTED_END_HOUR} AM ${
-        enableTimezoneRestriction ? TIMEZONE : "local time"
-      }. Current time: ${currentTime}`
-    );
-    return;
-  }
-
-  await safeSendMessage("🔍 Starting the check now. Please wait...");
-
+  // Check if a check is already running and abort if necessary
   if (state.isRunning) {
     console.log("⚠️ Check is running. Aborting previous check...");
     await safeSendMessage(
@@ -979,7 +989,6 @@ bot.onText(/\/checknow/, async (msg) => {
       state.currentAbortController.abort(); // Signal the current check to abort
     }
     // Give cleanup a moment before starting new check
-    // Note: A more robust way might involve waiting for a promise from cleanupResources
     await new Promise((resolve) => setTimeout(resolve, 2000));
     console.log("Previous check should be aborted. Starting new check.");
   }
@@ -999,74 +1008,137 @@ bot.onText(/\/checknow/, async (msg) => {
     state.notifyAvailableResolver = null;
   }
 
-  startCheckProcess(); // Start a new check
+  await safeSendMessage(
+    "🚀 Starting a manual check now (bypassing working hour restriction). Please wait..."
+  );
+  startCheckProcess(true); // Start check, bypassing working hour restriction
 });
 
-// Handler for /another command (reload captcha)
-bot.onText(/\/another/, async (msg) => {
+// Handler for /startat command
+bot.onText(/\/startat (\d{1,2}):(\d{2})/, async (msg, match) => {
   if (String(msg.chat.id) !== CHAT_ID) return;
 
-  if (!state.isRunning || !state.page) {
+  const hour = parseInt(match[1], 10);
+  const minute = parseInt(match[2], 10);
+
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
     await safeSendMessage(
-      "❓ Cannot get another captcha right now (no check running)."
+      "❌ Invalid time format. Please use HH:MM (24-hour format)."
     );
     return;
   }
 
-  console.log("Received /another command.");
+  state.workingStartHour = hour;
+  state.workingStartMinute = minute;
+
+  const workingPeriod = `${String(state.workingStartHour).padStart(
+    2,
+    "0"
+  )}:${String(state.workingStartMinute).padStart(2, "0")} to ${String(
+    state.workingEndHour
+  ).padStart(2, "0")}:${String(state.workingEndMinute).padStart(2, "0")}`;
   await safeSendMessage(
-    "🔄 Attempting to refresh the page to get a new captcha..."
+    `✅ Working hour start time set to ${String(hour).padStart(
+      2,
+      "0"
+    )}:${String(minute).padStart(2, "0")} ${
+      enableTimezoneRestriction ? TIMEZONE : "local time"
+    }. Current working period: ${workingPeriod}`
+  );
+  console.log(`Working hour start time set to ${hour}:${minute}`);
+});
+
+// Handler for /stopat command
+bot.onText(/\/stopat (\d{1,2}):(\d{2})/, async (msg, match) => {
+  if (String(msg.chat.id) !== CHAT_ID) return;
+
+  const hour = parseInt(match[1], 10);
+  const minute = parseInt(match[2], 10);
+
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    await safeSendMessage(
+      "❌ Invalid time format. Please use HH:MM (24-hour format)."
+    );
+    return;
+  }
+
+  state.workingEndHour = hour;
+  state.workingEndMinute = minute;
+
+  const workingPeriod = `${String(state.workingStartHour).padStart(
+    2,
+    "0"
+  )}:${String(state.workingStartMinute).padStart(2, "0")} to ${String(
+    state.workingEndHour
+  ).padStart(2, "0")}:${String(state.workingEndMinute).padStart(2, "0")}`;
+  await safeSendMessage(
+    `✅ Working hour end time set to ${String(hour).padStart(2, "0")}:${String(
+      minute
+    ).padStart(2, "0")} ${
+      enableTimezoneRestriction ? TIMEZONE : "local time"
+    }. Current working period: ${workingPeriod}`
+  );
+  console.log(`Working hour end time set to ${hour}:${minute}`);
+});
+
+// Handler for /toggle_log command
+bot.onText(/\/toggle_log/, async (msg) => {
+  if (String(msg.chat.id) !== CHAT_ID) return;
+
+  state.isLoggingEnabled = !state.isLoggingEnabled;
+  const status = state.isLoggingEnabled ? "ENABLED" : "DISABLED";
+  await safeSendMessage(
+    `✅ Logging to Telegram is now ${status}. (Warnings and Errors are always sent).`
+  );
+  console.log(`Logging to Telegram toggled to ${status}`);
+});
+
+// Handler for /shutdown command to completely stop the bot
+bot.onText(/\/shutdown/, async (msg) => {
+  if (String(msg.chat.id) !== CHAT_ID) return;
+
+  console.log("Received /stop command. Shutting down...");
+  await safeSendMessage(
+    "🛑 Shutting down bot. All checks and notifications will stop."
   );
 
-  try {
-    // Abort the current check's captcha solving process if it's stuck
-    if (state.currentAbortController) {
-      // Abort the current captcha solving/waiting process
-      state.currentAbortController.abort();
-      // Create a new controller for the subsequent steps
-      state.currentAbortController = new AbortController();
-    }
+  // Perform cleanup
+  await cleanupResources();
 
-    // Reload the page to force a new captcha
-    await state.page.reload({ waitUntil: "domcontentloaded" });
-    console.log("Reloaded page for new captcha.");
+  // Stop polling for new messages
+  bot.stopPolling();
 
-    // Inform the user what to expect next based on mode
-    if (enableAntiCaptcha) {
-      await safeSendMessage(
-        "✅ Page reloaded. The bot will attempt to solve the new captcha automatically."
-      );
-    } else {
-      await safeSendMessage(
-        "✅ Page reloaded. Please wait for the new captcha image to appear here so you can solve it manually."
-      );
-    }
-  } catch (error) {
-    console.error(`Error handling /another: ${error.message}`);
-    await safeSendMessage(
-      `⚠️ Error reloading page for new captcha: ${error.message}`
-    );
-  }
+  // Exit the Node.js process
+  process.exit(0);
 });
 
 // --- Cron Job Scheduling ---
 console.log(
-  `Scheduling check with cron schedule: "${CRON_SCHEDULE}". Checks restricted between ${RESTRICTED_START_HOUR} AM and ${RESTRICTED_END_HOUR} AM ${
-    enableTimezoneRestriction ? TIMEZONE : "local time"
-  }.`
+  `Scheduling check with cron schedule: "${CRON_SCHEDULE}". Checks restricted dynamically.`
 );
 cron.schedule(CRON_SCHEDULE, () => {
   console.log("⏰ Cron job triggered.");
 
-  // Check if within restricted hours before starting
-  if (isWithinRestrictedHours()) {
+  // Check if within working hours before starting
+  // Cron should only run *within* the defined working hours.
+  if (!isWithinWorkingHours()) {
     const currentTime = getCurrentTimeString();
+    const workingPeriod = `${String(state.workingStartHour).padStart(
+      2,
+      "0"
+    )}:${String(state.workingStartMinute).padStart(2, "0")} to ${String(
+      state.workingEndHour
+    ).padStart(2, "0")}:${String(state.workingEndMinute).padStart(2, "0")}`;
     console.log(
-      `🚫 Cron skipped. Currently within restricted hours (${RESTRICTED_START_HOUR} AM to ${RESTRICTED_END_HOUR} AM ${
+      `🚫 Cron skipped. Currently outside working hours (${workingPeriod} ${
         enableTimezoneRestriction ? TIMEZONE : "local time"
       }). Current time: ${currentTime}`
     );
-    // No need to send Telegram message for every skipped cron run
+    // Only send a message if logging is enabled to avoid spam during off-hours
+    if (state.isLoggingEnabled) {
+      // Optional: send a message indicating cron was skipped due to working hours
+      // await safeSendMessage(`⏰ Cron check skipped. Currently outside working hours (${workingPeriod}).`);
+    }
     return;
   }
 
@@ -1080,12 +1152,18 @@ cron.schedule(CRON_SCHEDULE, () => {
     // safeSendMessage("⏰ Reminder: Still waiting for captcha input.");
     return;
   }
-  startCheckProcess(); // Start check if not running and not waiting for manual captcha
+  startCheckProcess(false); // Start check, respecting working hour restriction
 });
 
 // --- Initial Run and Startup Message ---
 (async () => {
-  let startupMessage = `👋 Bot started. Initial check starting now...\n\nAvailable commands:\n/checknow - Run check immediately\n/another - Reload page to get a new captcha\nOK - Stop appointment alerts`;
+  const workingPeriod = `${String(state.workingStartHour).padStart(
+    2,
+    "0"
+  )}:${String(state.workingStartMinute).padStart(2, "0")} to ${String(
+    state.workingEndHour
+  ).padStart(2, "0")}:${String(state.workingEndMinute).padStart(2, "0")}`;
+  let startupMessage = `👋 Bot started. Initial check starting now...\n\nAvailable commands:\n/checknow - Run a single check immediately (bypasses working hour restriction)\n/startat HH:MM - Set the start time for the working period\n/stopat HH:MM - Set the stop time for the working period\n/toggle_log - Toggle sending general logs to Telegram (Warnings and Errors are always sent)\n/stop - Stop the bot completely\nOK - Stop appointment alerts`; // Updated command list
 
   if (enableAntiCaptcha) {
     startupMessage += `\n🤖 Automated captcha solving is enabled.`;
@@ -1105,13 +1183,13 @@ cron.schedule(CRON_SCHEDULE, () => {
     startupMessage += `\n⚠️ Pushbullet notifications are NOT enabled (check .env).`;
   }
 
-  startupMessage += `\n\nChecks are restricted between ${RESTRICTED_START_HOUR} AM and ${RESTRICTED_END_HOUR} AM ${
+  startupMessage += `\n\nScheduled checks will run *only* between ${workingPeriod} ${
     enableTimezoneRestriction ? TIMEZONE : "local time"
-  }.`;
+  }. Use /checknow for an immediate check that bypasses this restriction.`;
 
   await safeSendMessage(startupMessage);
-  // Start the first check immediately, but it will be skipped if within restricted hours
-  startCheckProcess();
+  // Start the first check immediately, but it will be skipped if outside working hours
+  startCheckProcess(false); // Initial check respects working hour restriction
 })();
 
 console.log("🤖 Telegram bot polling started...");
