@@ -1097,7 +1097,7 @@ bot.onText(/\/toggle_log/, async (msg) => {
 bot.onText(/\/shutdown/, async (msg) => {
   if (String(msg.chat.id) !== CHAT_ID) return;
 
-  console.log("Received /stop command. Shutting down...");
+  console.log("Received /shutdown command. Shutting down...");
   await safeSendMessage(
     "🛑 Shutting down bot. All checks and notifications will stop."
   );
@@ -1163,7 +1163,7 @@ cron.schedule(CRON_SCHEDULE, () => {
   )}:${String(state.workingStartMinute).padStart(2, "0")} to ${String(
     state.workingEndHour
   ).padStart(2, "0")}:${String(state.workingEndMinute).padStart(2, "0")}`;
-  let startupMessage = `👋 Bot started. Initial check starting now...\n\nAvailable commands:\n/checknow - Run a single check immediately (bypasses working hour restriction)\n/startat HH:MM - Set the start time for the working period\n/stopat HH:MM - Set the stop time for the working period\n/toggle_log - Toggle sending general logs to Telegram (Warnings and Errors are always sent)\n/stop - Stop the bot completely\nOK - Stop appointment alerts`; // Updated command list
+  let startupMessage = `👋 Bot started. Initial check starting now...\n\nAvailable commands:\n/checknow - Run a single check immediately (bypasses working hour restriction)\n/startat HH:MM - Set the start time for the working period\n/stopat HH:MM - Set the stop time for the working period\n/toggle_log - Toggle sending general logs to Telegram (Warnings and Errors are always sent)\n/shutdown - Stop the bot completely\nOK - Stop appointment alerts`; // Updated command list
 
   if (enableAntiCaptcha) {
     startupMessage += `\n🤖 Automated captcha solving is enabled.`;
