@@ -709,6 +709,7 @@ async function runCheck(signal) {
     console.log(" puppeteer launch...");
     state.browser = await puppeteer.launch({
       headless: "new", // Use "new" headless mode
+      args: ["--no-sandbox", "--disable-setuid-sandbox"], // Add necessary arguments
     });
     state.page = await state.browser.newPage();
     await state.page.setUserAgent(
