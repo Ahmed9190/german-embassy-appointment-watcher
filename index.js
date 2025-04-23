@@ -167,7 +167,7 @@ let state = {
   workingStartMinute: DEFAULT_WORKING_START_MINUTE,
   workingEndHour: DEFAULT_WORKING_END_HOUR,
   workingEndMinute: DEFAULT_WORKING_END_MINUTE,
-  isLoggingEnabled: true, // New state variable for toggling logs
+  isLoggingEnabled: false,
 };
 
 // --- Helper Functions ---
