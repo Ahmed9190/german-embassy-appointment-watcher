@@ -709,8 +709,6 @@ async function runCheck(signal) {
     console.log(" puppeteer launch...");
     state.browser = await puppeteer.launch({
       headless: "new", // Use "new" headless mode
-      args: ["--no-sandbox", "--disable-dev-shm-usage"], // Common args for server environments
-      protocolTimeout: 120000, // Increased timeout for protocol operations (2 minutes)
     });
     state.page = await state.browser.newPage();
     await state.page.setUserAgent(
