@@ -470,6 +470,10 @@ async function solveCaptcha(base64Image, signal) {
         task: {
           type: ANTICAPTCHA_TASK_TYPE,
           body: base64Image,
+          minLength: 6,
+          maxLength: 6,
+          case: true,
+          numeric: 0,
         },
         // Optional: Add websiteUrl if needed by the service for context
         // websiteUrl: APPOINTMENT_URL,
