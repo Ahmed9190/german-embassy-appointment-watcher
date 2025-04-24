@@ -40,7 +40,6 @@ RUN apt-get install -y \
   libxi6 \
   libxrandr2 \
   libxrender1 \
-  libxshmfence6 \
   libxtst6 \
   ca-certificates \
   fonts-wqy-zenhei \
