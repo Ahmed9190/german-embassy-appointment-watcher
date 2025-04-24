@@ -3,7 +3,11 @@ FROM node:23.11.0-bookworm-slim
 
 # Install necessary dependencies for Puppeteer/Chromium
 # These packages are generally required for headless Chromium to run
-RUN apt-get update && apt-get install -y \
+# Running update in a separate step to ensure package lists are fresh
+RUN apt-get update
+
+# Install the required packages
+RUN apt-get install -y \
   chromium \
   fonts-liberation \
   libasound2 \
@@ -41,10 +45,10 @@ RUN apt-get update && apt-get install -y \
   ca-certificates \
   fonts-wqy-zenhei \
   --no-install-recommends && \
-  rm -rf /var/lib/apt/lists/*
+  rm -rf /var/lib/apt/lists/* # Clean up apt lists to reduce image size
 
 # Set environment variable so Puppeteer skips downloading Chromium
-# We are still using the system-installed Chromium from apt
+# We are using the system-installed Chromium from apt
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
