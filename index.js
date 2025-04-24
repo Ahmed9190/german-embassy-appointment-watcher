@@ -112,7 +112,7 @@ if (enableEmail) {
     service: "gmail", // Or your email service
     auth: {
       user: EMAIL_SENDER,
-      pass: EMAIL_PASSWORD, // Use App Password for Gmail
+      pass: EMAIL_PASSWORD, // Use an App Password if using Gmail
     },
   });
 }
@@ -681,6 +681,10 @@ async function checkForNoAppointments() {
   if (!state.page) throw new Error("Page is not initialized.");
   try {
     // More robust check: wait for body, then evaluate
+    // Note: If waitForSelector("body") times out, it throws an error,
+    // which is caught below, causing the function to return false.
+    // This means if the page structure is unexpected (e.g., body doesn't load),
+    // the script will assume appointments *might* be available.
     await state.page.waitForSelector("body", { timeout: 5000 });
     return await state.page.evaluate((text) => {
       // Use XPath for potentially more reliable text finding
@@ -899,7 +903,7 @@ async function runCheckLogic(signal) {
           console.log("‼️ Appointments found for NEXT month!");
           const message = `‼️ Appointment AVAILABLE (Next Month)! ‼️\n${APPOINTMENT_URL}`;
           // Await the notification process to complete
-          await notifyAvailable(message);
+          await notifyAvailable(message); // <--- AWAITING NOTIFICATIONS HERE
         }
       } catch (error) {
         if (error.name === "AbortError") {
@@ -915,7 +919,7 @@ async function runCheckLogic(signal) {
       console.log("‼️ Appointments found for CURRENT month!");
       const message = `‼️ Appointment AVAILABLE NOW! ‼️\n${APPOINTMENT_URL}`;
       // Await the notification process to complete
-      await notifyAvailable(message);
+      await notifyAvailable(message); // <--- AWAITING NOTIFICATIONS HERE
     }
 
     console.log("✅ Check completed successfully.");
@@ -932,7 +936,8 @@ async function runCheckLogic(signal) {
       throw error; // Re-throw to be caught by the retry logic
     }
   } finally {
-    // Cleanup resources after each attempt (successful or failed)
+    // Cleanup resources after each attempt (successful or failed),
+    // but only AFTER notifyAvailable has finished if it was called.
     await cleanupResources();
   }
 }
